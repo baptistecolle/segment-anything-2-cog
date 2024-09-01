@@ -8,3 +8,13 @@ build/*
 _C.*
 outputs/*
 checkpoints/*.pt
+.cog
+*.mp4
+/predict_outputs/
+/video_frames/
+/video_predictor_example.py
+output.*.png
+output.*.webp
+output.*.jpg
+output.*.jpeg
+output.*.mp4
