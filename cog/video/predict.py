@@ -280,7 +280,8 @@ class Predictor(BasePredictor):
             for click, click_type, frame, obj_id in zip(
                 click_list, click_labels_list, click_frames_list, object_ids_int_list
             ):
-                points = np.array([click], dtype=np.float32) # TODO i use points as boxes this is wrong
+                points = np.array([click]) # TODO i use points as boxes this is wrong
+                print(points)
                 labels = np.array([click_type], dtype=np.int32)
                 _, _, _ = self.predictor.add_new_points_or_box(
                     inference_state=inference_state,
