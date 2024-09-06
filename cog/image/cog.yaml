@@ -1,6 +1,6 @@
 # Configuration for Cog ⚙️
 # Reference: https://cog.run/yaml
-
+image: "r8.im/baptistecolle/sam2-image"
 build:
   # set to true if your model requires a GPU
   gpu: true

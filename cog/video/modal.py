@@ -1,60 +1,99 @@
-# Prediction interface for Cog ⚙️
-# https://cog.run/python
-
-
-
-
-import os
-import io
-import time
-import torch
-import mimetypes
 import subprocess
-import numpy as np
-from tqdm import tqdm
-from PIL import Image
+import modal
+import os
+import time
+
+import modal.gpu
+import torch
 import supervision as sv
-from typing import Iterator
-import matplotlib.pyplot as plt
-from cog import BasePredictor, Input, Path
-from contextlib import contextmanager
-import shutil
-import tempfile
 
+app_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git")
+    .pip_install(
+        "torch>=2.3.1",
+        "torchvision>=0.18.1",
+        "numpy>=1.24.4",
+        "tqdm>=4.66.1",
+        "hydra-core>=1.3.2",
+        "iopath>=0.1.10",
+        "pillow>=9.4.0",
+        "git@github.com:facebookresearch/segment-anything-2.git",
+    )
+)
 
-mimetypes.add_type("image/webp", ".webp")
-
-
+app = modal.App("stable-diffusion-xl")
 
 
 DEVICE = "cuda"
 MODEL_CACHE = "checkpoints"
 BASE_URL = f"https://weights.replicate.delivery/default/sam-2/{MODEL_CACHE}/"
+model_files = ["sam2_hiera_large.pt"]
 
 
+@app.cls(gpu=modal.gpu.A10G(), container_idle_timeout=240, image=app_image)
+class SAM2_Online:
+    def __init__(self):
+        self.model = ...
+
+    @modal.build()  # add another step to the image build
+    def download_weights(self):
+        
+        for model_file in model_files:
+            url = BASE_URL + model_file
+            filename = url.split("/")[-1]
+            dest_path = os.path.join(MODEL_CACHE, filename)
+            if not os.path.exists(dest_path.replace(".tar", "")):
+                start = time.time()
+                print("[!] Initiating download from URL: ", url)
+                print("[~] Destination path: ", dest)
+                if ".tar" in dest:
+                    dest = os.path.dirname(dest)
+                command = ["pget", "-vf" + ("x" if ".tar" in url else ""), url, dest]
+                try:
+                    print(f"[~] Running command: {' '.join(command)}")
+                    subprocess.check_call(command, close_fds=False)
+                except subprocess.CalledProcessError as e:
+                    print(
+                        f"[ERROR] Failed to download weights. Command '{' '.join(e.cmd)}' returned non-zero exit status {e.returncode}."
+                    )
+                    raise
+                print("[+] Download completed in: ", time.time() - start, "seconds")
 
 
-def download_weights(url: str, dest: str) -> None:
-    start = time.time()
-    print("[!] Initiating download from URL: ", url)
-    print("[~] Destination path: ", dest)
-    if ".tar" in dest:
-        dest = os.path.dirname(dest)
-    command = ["pget", "-vf" + ("x" if ".tar" in url else ""), url, dest]
-    try:
-        print(f"[~] Running command: {' '.join(command)}")
-        subprocess.check_call(command, close_fds=False)
-    except subprocess.CalledProcessError as e:
-        print(
-            f"[ERROR] Failed to download weights. Command '{' '.join(e.cmd)}' returned non-zero exit status {e.returncode}."
-        )
-        raise
-    print("[+] Download completed in: ", time.time() - start, "seconds")
+        model_cfg = "sam2_hiera_l.yaml"
+        
+
+    @modal.enter()
+    def load_model(self):
+        
+        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 
 
+        # Enable bfloat16 and TF32 for better performance
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+        if torch.cuda.get_device_properties(0).major >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
 
 
-class Predictor(BasePredictor):
+        self.mask_annotator = sv.MaskAnnotator()
+        self.box_annotator = sv.BoxAnnotator()
+
+    
+    def _inference(self, todo):
+        ...
+
+    @modal.method()
+    def inference(self, todo):
+        ...
+
+    @modal.web_endpoint(docs=True)
+    def web_inference(self, todo):
+        ...
+
+
+    
     def setup(self) -> None:
         global build_sam2_video_predictor
 
@@ -280,9 +319,9 @@ class Predictor(BasePredictor):
             for click, click_type, frame, obj_id in zip(
                 click_list, click_labels_list, click_frames_list, object_ids_int_list
             ):
-                points = np.array([click], dtype=np.float32) # TODO i use points as boxes this is wrong
+                points = np.array([click], dtype=np.float32)
                 labels = np.array([click_type], dtype=np.int32)
-                _, _, _ = self.predictor.add_new_points_or_box(
+                _, _, _ = self.predictor.add_new_points(
                     inference_state=inference_state,
                     frame_idx=frame,
                     obj_id=obj_id,
@@ -299,67 +338,87 @@ class Predictor(BasePredictor):
             frames_generator = sv.get_video_frames_generator(str(input_video))
 
 
-            # if output_video:
-            video_path = output_dir / "output_video.mp4"
-            frame_paths = []
+            if output_video:
+                video_path = output_dir / "output_video.mp4"
+                frame_paths = []
 
 
-            for frame_idx, (frame, (_, tracker_ids, mask_logits)) in enumerate(
-                zip(frames_generator, masks_generator)
-            ):
-                if frame_idx % output_frame_interval != 0:
-                    continue
+                for frame_idx, (frame, (_, tracker_ids, mask_logits)) in enumerate(
+                    zip(frames_generator, masks_generator)
+                ):
+                    if frame_idx % output_frame_interval != 0:
+                        continue
 
 
-                annotated_frame = self.process_frame(
-                    frame, mask_logits, tracker_ids, mask_type, annotation_type
+                    annotated_frame = self.process_frame(
+                        frame, mask_logits, tracker_ids, mask_type, annotation_type
+                    )
+                    frame_path = frame_directory_path / f"frame_{frame_idx:05d}.png"
+                    Image.fromarray(annotated_frame).save(frame_path)
+                    frame_paths.append(frame_path)
+
+
+                # Use FFmpeg to create the video
+                first_frame = Image.open(frame_paths[0])
+                frame_width, frame_height = first_frame.size
+
+
+                ffmpeg_command = (
+                    f"ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt rgb24 "
+                    f"-s {frame_width}x{frame_height} -r {video_fps} "
+                    f"-i - -c:v h264_nvenc -preset p7 -tune hq "
+                    f"-rc vbr -cq 10 -qmin 10 -qmax 20 "
+                    f"-b:v 0 -maxrate:v 200M -bufsize 200M "
+                    f"-profile:v high -pix_fmt yuv420p "
+                    f"-gpu 0 -rc-lookahead 32 -temporal-aq 1 -aq-strength 15 "
+                    f"{video_path}"
                 )
-                frame_path = frame_directory_path / f"frame_{frame_idx:05d}.png"
-                Image.fromarray(annotated_frame).save(frame_path)
-                frame_paths.append(frame_path)
-
-            print("Creating video...")
-
-            # Use FFmpeg to create the video
-            first_frame = Image.open(frame_paths[0])
-            frame_width, frame_height = first_frame.size
+                ffmpeg_process = subprocess.Popen(
+                    ffmpeg_command.split(),
+                    stdin=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
 
 
-            ffmpeg_command = (
-                f"ffmpeg -y -f rawvideo -vcodec rawvideo -pix_fmt rgb24 "
-                f"-s {frame_width}x{frame_height} -r {video_fps} "
-                f"-i - -c:v h264_nvenc -preset p7 -tune hq "
-                f"-rc vbr -cq 10 -qmin 10 -qmax 20 "
-                f"-b:v 0 -maxrate:v 200M -bufsize 200M "
-                f"-profile:v high -pix_fmt yuv420p "
-                f"-gpu 0 -rc-lookahead 32 -temporal-aq 1 -aq-strength 15 "
-                f"{video_path}"
-            )
-            ffmpeg_process = subprocess.Popen(
-                ffmpeg_command.split(),
-                stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+                for frame_path in frame_paths:
+                    with Image.open(frame_path) as img:
+                        frame_data = np.array(img.convert("RGB"))
+                        # Convert BGR to RGB
+                        frame_data = frame_data[:, :, ::-1]
+                        ffmpeg_process.stdin.write(frame_data.tobytes())
 
 
-            for frame_path in frame_paths:
-                with Image.open(frame_path) as img:
-                    frame_data = np.array(img.convert("RGB"))
-                    # Convert BGR to RGB
-                    frame_data = frame_data[:, :, ::-1]
-                    ffmpeg_process.stdin.write(frame_data.tobytes())
+                ffmpeg_process.stdin.close()
+                ffmpeg_process.wait()
 
 
-            ffmpeg_process.stdin.close()
-            ffmpeg_process.wait()
+                # Clean up temporary frame files
+                for frame_path in frame_paths:
+                    frame_path.unlink()
 
 
-            # Clean up temporary frame files
-            for frame_path in frame_paths:
-                frame_path.unlink()
+                yield video_path
 
 
-            return video_path
+            else:
+                for frame_idx, (frame, (_, tracker_ids, mask_logits)) in enumerate(
+                    zip(frames_generator, masks_generator)
+                ):
+                    if frame_idx % output_frame_interval != 0:
+                        continue
+
+
+                    annotated_frame = self.process_frame(
+                        frame, mask_logits, tracker_ids, mask_type, annotation_type
+                    )
+                    output_path = output_dir / f"frame_{frame_idx:05d}.{output_format}"
+                    self.save_image(
+                        Image.fromarray(annotated_frame),
+                        output_path,
+                        output_format,
+                        output_quality,
+                    )
+                    yield output_path
 
 
     def process_frame(
@@ -396,3 +455,4 @@ class Predictor(BasePredictor):
 
 
         return annotated_frame
+
